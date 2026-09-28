@@ -29,29 +29,32 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip"
-import { apiFetch } from "@/lib/api-client"
-import { getStoredValue } from "@/lib/browser-storage"
+import {
+  createMailTmAccount,
+  getMailTmDomains,
+  listMailTmMessages,
+  readMailTmMessage,
+  type MailTmAccount,
+} from "@/lib/mail-tm-client"
+import { getCachedReadIds, setCachedReadIds } from "@/lib/read-message-cache"
 import {
   formatReceivedTime,
   haveSameMessageSummaries,
 } from "@/lib/mail-display"
-import { getMailDomains, isValidDomain } from "@/lib/mail-domains"
 import type { MessageSummary, StoredMessage } from "@/lib/mail-types"
-import {
-  getCachedReadIds,
-  setCachedReadIds,
-} from "@/lib/read-message-cache"
 import { cn } from "@/lib/utils"
-
-const MAIL_DOMAINS = getMailDomains()
 
 const MAILBOX_STORAGE_KEY = "temp-mail:mailbox"
 const DOMAIN_STORAGE_KEY = "temp-mail:domain"
+const ACCOUNT_STORAGE_KEY = "temp-mail:mailtm-account"
+
 const mailboxNumbers = Array.from({ length: 9000 }, (_, index) =>
   String(index + 100),
 )
 
 function randomIndex(max: number) {
+  if (max <= 0) return 0
+
   if (typeof crypto !== "undefined" && crypto.getRandomValues) {
     const values = new Uint32Array(1)
     crypto.getRandomValues(values)
@@ -76,12 +79,13 @@ function createMailboxName() {
   })
 }
 
-function randomDomain(current?: string) {
-  if (MAIL_DOMAINS.length === 1) return MAIL_DOMAINS[0]
+function randomDomain(domains: string[], current?: string) {
+  if (domains.length === 0) return ""
+  if (domains.length === 1) return domains[0]
 
   const available = current
-    ? MAIL_DOMAINS.filter((domain) => domain !== current)
-    : MAIL_DOMAINS
+    ? domains.filter((domain) => domain !== current)
+    : domains
 
   return available[randomIndex(available.length)]
 }
@@ -90,36 +94,48 @@ function isValidMailbox(value: string) {
   return /^[a-z0-9][a-z0-9._-]{1,63}$/.test(value)
 }
 
-function parseSharedEmail(value: string | null) {
-  if (!value) return null
+function splitAddress(address: string) {
+  const separator = address.lastIndexOf("@")
+  if (separator <= 0 || separator === address.length - 1) return null
 
-  const normalized = value.trim().toLowerCase()
-  const separator = normalized.lastIndexOf("@")
+  const mailbox = address.slice(0, separator).toLowerCase()
+  const domain = address.slice(separator + 1).toLowerCase()
 
-  if (separator <= 0 || separator === normalized.length - 1) return null
-
-  const mailbox = normalized.slice(0, separator)
-  const domain = normalized.slice(separator + 1)
-
-  if (!isValidMailbox(mailbox) || !isValidDomain(domain)) return null
-
-  return { mailbox, domain }
+  return isValidMailbox(mailbox) ? { mailbox, domain } : null
 }
 
-async function copyText(value: string) {
-  if (navigator.clipboard && window.isSecureContext) {
-    await navigator.clipboard.writeText(value)
-    return
-  }
+function readStoredAccount() {
+  if (typeof window === "undefined") return null
 
-  const textarea = document.createElement("textarea")
-  textarea.value = value
-  textarea.style.position = "fixed"
-  textarea.style.opacity = "0"
-  document.body.appendChild(textarea)
-  textarea.select()
-  document.execCommand("copy")
-  textarea.remove()
+  try {
+    const raw = window.localStorage.getItem(ACCOUNT_STORAGE_KEY)
+    if (!raw) return null
+
+    const value = JSON.parse(raw) as Partial<MailTmAccount>
+
+    if (
+      typeof value.id !== "string" ||
+      typeof value.address !== "string" ||
+      typeof value.password !== "string" ||
+      typeof value.token !== "string"
+    ) {
+      return null
+    }
+
+    return value as MailTmAccount
+  } catch {
+    return null
+  }
+}
+
+function saveStoredAccount(account: MailTmAccount) {
+  window.localStorage.setItem(ACCOUNT_STORAGE_KEY, JSON.stringify(account))
+  const parts = splitAddress(account.address)
+
+  if (parts) {
+    window.localStorage.setItem(MAILBOX_STORAGE_KEY, parts.mailbox)
+    window.localStorage.setItem(DOMAIN_STORAGE_KEY, parts.domain)
+  }
 }
 
 function InboxSkeleton() {
@@ -154,8 +170,9 @@ function EmptyInbox() {
 }
 
 export function TempMailApp() {
+  const [account, setAccount] = useState<MailTmAccount | null>(null)
   const [mailbox, setMailbox] = useState("")
-  const [domain, setDomain] = useState(MAIL_DOMAINS[0])
+  const [domain, setDomain] = useState("")
   const [isSharedMailbox, setIsSharedMailbox] = useState(false)
   const [draftMailbox, setDraftMailbox] = useState("")
   const [ready, setReady] = useState(false)
@@ -168,6 +185,7 @@ export function TempMailApp() {
   const [loadingInbox, setLoadingInbox] = useState(true)
   const [loadingMessage, setLoadingMessage] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
+  const [creatingMailbox, setCreatingMailbox] = useState(false)
   const [readIds, setReadIds] = useState<Set<string>>(new Set())
   const knownIds = useRef<Set<string>>(new Set())
   const hasLoaded = useRef(false)
@@ -176,156 +194,218 @@ export function TempMailApp() {
     target: string
   } | null>(null)
 
-  const email = mailbox ? `${mailbox}@${domain}` : `••••••@${domain}`
+  const email = account?.address || "••••••@••••••"
 
   useEffect(() => {
-    const timeout = window.setTimeout(() => {
-      const sharedEmail = parseSharedEmail(
-        new URLSearchParams(window.location.search).get("mail"),
-      )
+    let cancelled = false
 
-      if (sharedEmail) {
-        setMailbox(sharedEmail.mailbox)
-        setDomain(sharedEmail.domain)
-        setDraftMailbox(sharedEmail.mailbox)
-        setReadIds(getCachedReadIds(sharedEmail.mailbox))
-        setIsSharedMailbox(true)
+    async function initialize() {
+      try {
+        let nextAccount = readStoredAccount()
+
+        if (!nextAccount) {
+          const domains = await getMailTmDomains()
+
+          if (domains.length === 0) {
+            throw new Error("Mail.tm não retornou nenhum domínio disponível.")
+          }
+
+          const nextDomain = randomDomain(domains)
+          nextAccount = await createMailTmAccount(
+            createMailboxName(),
+            nextDomain,
+          )
+        }
+
+        const parts = splitAddress(nextAccount.address)
+
+        if (!parts) {
+          throw new Error("A conta temporária salva é inválida.")
+        }
+
+        if (cancelled) return
+
+        saveStoredAccount(nextAccount)
+        setAccount(nextAccount)
+        setMailbox(parts.mailbox)
+        setDomain(parts.domain)
+        setDraftMailbox(parts.mailbox)
+        setReadIds(getCachedReadIds(parts.mailbox))
         setReady(true)
+      } catch (error) {
+        if (!cancelled) {
+          toast.error(
+            error instanceof Error
+              ? error.message
+              : "Não foi possível criar o endereço temporário.",
+          )
+          setLoadingInbox(false)
+        }
+      }
+    }
+
+    void initialize()
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  const loadMessages = useCallback(
+    async (activeAccount: MailTmAccount, silent = false) => {
+      if (!activeAccount.address) return
+
+      if (inboxRequest.current?.target === activeAccount.address) {
+        setRefreshing(false)
         return
       }
 
-      const saved = getStoredValue(MAILBOX_STORAGE_KEY, "mailbox")
-      const savedDomain = getStoredValue(DOMAIN_STORAGE_KEY, "domain")
-      const initial =
-        saved && isValidMailbox(saved) ? saved : createMailboxName()
-      const initialDomain =
-        savedDomain && MAIL_DOMAINS.includes(savedDomain)
-          ? savedDomain
-          : randomDomain()
-
-      window.localStorage.setItem(MAILBOX_STORAGE_KEY, initial)
-      window.localStorage.setItem(DOMAIN_STORAGE_KEY, initialDomain)
-      setMailbox(initial)
-      setDomain(initialDomain)
-      setDraftMailbox(initial)
-      setReadIds(getCachedReadIds(initial))
-      setReady(true)
-    }, 0)
-
-    return () => window.clearTimeout(timeout)
-  }, [])
-
-  const loadMessages = useCallback(async (target: string, silent = false) => {
-    if (!target) return
-
-    if (inboxRequest.current?.target === target) {
-      setRefreshing(false)
-      return
-    }
-
-    inboxRequest.current?.controller.abort()
-    const controller = new AbortController()
-    inboxRequest.current = { controller, target }
-
-    if (!silent) setLoadingInbox(true)
-
-    try {
-      const response = await apiFetch("/api/list", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: target }),
-        cache: "no-store",
-        signal: controller.signal,
-      })
-
-      if (!response.ok) throw new Error("Não foi possível atualizar a caixa.")
-
-      const data = (await response.json()) as { messages?: MessageSummary[] }
-      const nextMessages = Array.isArray(data.messages) ? data.messages : []
-
-      if (
-        silent &&
-        hasLoaded.current &&
-        nextMessages.some((message) => !knownIds.current.has(message.id))
-      ) {
-        toast.success("Nova mensagem recebida!", {
-          position: "bottom-right",
-        })
+      inboxRequest.current?.controller.abort()
+      const controller = new AbortController()
+      inboxRequest.current = {
+        controller,
+        target: activeAccount.address,
       }
 
-      knownIds.current = new Set(
-        nextMessages.map((message) => message.id),
-      )
-      hasLoaded.current = true
-      setMessages((current) =>
-        haveSameMessageSummaries(current, nextMessages)
-          ? current
-          : nextMessages,
-      )
-    } catch (error) {
-      if (
-        !silent &&
-        !(error instanceof DOMException && error.name === "AbortError")
-      ) {
-        toast.error(
-          error instanceof Error ? error.message : "Erro ao carregar mensagens.",
+      if (!silent) setLoadingInbox(true)
+
+      try {
+        const nextMessages = await listMailTmMessages(
+          activeAccount,
+          controller.signal,
         )
+
+        saveStoredAccount(activeAccount)
+
+        if (
+          silent &&
+          hasLoaded.current &&
+          nextMessages.some((message) => !knownIds.current.has(message.id))
+        ) {
+          toast.success("Nova mensagem recebida!", {
+            position: "bottom-right",
+          })
+        }
+
+        knownIds.current = new Set(
+          nextMessages.map((message) => message.id),
+        )
+        hasLoaded.current = true
+        setMessages((current) =>
+          haveSameMessageSummaries(current, nextMessages)
+            ? current
+            : nextMessages,
+        )
+      } catch (error) {
+        if (
+          !silent &&
+          !(error instanceof DOMException && error.name === "AbortError")
+        ) {
+          toast.error(
+            error instanceof Error
+              ? error.message
+              : "Erro ao carregar mensagens.",
+          )
+        }
+      } finally {
+        if (inboxRequest.current?.controller === controller) {
+          inboxRequest.current = null
+          setLoadingInbox(false)
+          setRefreshing(false)
+        }
       }
-    } finally {
-      if (inboxRequest.current?.controller === controller) {
-        inboxRequest.current = null
-        setLoadingInbox(false)
-        setRefreshing(false)
-      }
-    }
-  }, [])
+    },
+    [],
+  )
 
   useEffect(() => {
-    if (!ready || !mailbox) return
+    if (!ready || !account) return
 
     hasLoaded.current = false
     knownIds.current = new Set()
 
     const initialLoad = window.setTimeout(() => {
-      void loadMessages(mailbox)
+      void loadMessages(account)
     }, 0)
 
     const interval = window.setInterval(() => {
-      void loadMessages(mailbox, true)
+      void loadMessages(account, true)
     }, 3_000)
 
     return () => {
       window.clearTimeout(initialLoad)
       window.clearInterval(interval)
-      if (inboxRequest.current?.target === mailbox) {
+      if (inboxRequest.current?.target === account.address) {
         inboxRequest.current.controller.abort()
         inboxRequest.current = null
       }
     }
-  }, [loadMessages, mailbox, ready])
+  }, [account, loadMessages, ready])
 
-  function switchMailbox(nextMailbox: string, nextDomain = domain) {
-    window.localStorage.setItem(MAILBOX_STORAGE_KEY, nextMailbox)
-    window.localStorage.setItem(DOMAIN_STORAGE_KEY, nextDomain)
+  function switchAccount(nextAccount: MailTmAccount) {
+    const parts = splitAddress(nextAccount.address)
+    if (!parts) return
+
+    saveStoredAccount(nextAccount)
 
     const url = new URL(window.location.href)
     url.searchParams.delete("mail")
-    window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`)
+    window.history.replaceState(
+      {},
+      "",
+      \`\${url.pathname}\${url.search}\${url.hash}\`,
+    )
 
-    setMailbox(nextMailbox)
-    setDomain(nextDomain)
+    setAccount(nextAccount)
+    setMailbox(parts.mailbox)
+    setDomain(parts.domain)
     setIsSharedMailbox(false)
-    setDraftMailbox(nextMailbox)
+    setDraftMailbox(parts.mailbox)
     setMessages([])
     setSelectedId(null)
     setSelectedMessage(null)
-    setReadIds(getCachedReadIds(nextMailbox))
+    setReadIds(getCachedReadIds(parts.mailbox))
     setIsEditing(false)
   }
 
+  async function createNewMailbox(customMailbox?: string) {
+    setCreatingMailbox(true)
+
+    try {
+      const domains = await getMailTmDomains()
+
+      if (domains.length === 0) {
+        throw new Error("Nenhum domínio Mail.tm está disponível no momento.")
+      }
+
+      const nextMailbox = customMailbox || createMailboxName()
+      const nextDomain = customMailbox
+        ? domain || randomDomain(domains)
+        : randomDomain(domains, domain)
+
+      const nextAccount = await createMailTmAccount(
+        nextMailbox,
+        nextDomain,
+      )
+
+      switchAccount(nextAccount)
+      toast.success(
+        customMailbox ? "E-mail atualizado!" : "Novo endereço criado!",
+        { position: "bottom-right" },
+      )
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "Não foi possível criar o endereço.",
+      )
+    } finally {
+      setCreatingMailbox(false)
+    }
+  }
+
   function randomizeMailbox() {
-    switchMailbox(createMailboxName(), randomDomain(domain))
-    toast.success("Novo endereço criado!")
+    void createNewMailbox()
   }
 
   function saveCustomMailbox() {
@@ -345,8 +425,24 @@ export function TempMailApp() {
       return
     }
 
-    switchMailbox(normalized)
-    toast.success("E-mail atualizado!", { position: "bottom-right" })
+    setIsEditing(false)
+    void createNewMailbox(normalized)
+  }
+
+  async function copyText(value: string) {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(value)
+      return
+    }
+
+    const textarea = document.createElement("textarea")
+    textarea.value = value
+    textarea.style.position = "fixed"
+    textarea.style.opacity = "0"
+    document.body.appendChild(textarea)
+    textarea.select()
+    document.execCommand("copy")
+    textarea.remove()
   }
 
   async function handleCopy() {
@@ -373,6 +469,8 @@ export function TempMailApp() {
   }
 
   async function openMessage(summary: MessageSummary) {
+    if (!account) return
+
     setSelectedId(summary.id)
     setLoadingMessage(true)
     setReadIds((current) => {
@@ -382,15 +480,9 @@ export function TempMailApp() {
     })
 
     try {
-      const response = await apiFetch("/api/read", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: mailbox, id: summary.id }),
-        cache: "no-store",
-      })
-
-      if (!response.ok) throw new Error("Mensagem não encontrada.")
-      setSelectedMessage((await response.json()) as StoredMessage)
+      const message = await readMailTmMessage(account, summary.id)
+      saveStoredAccount(account)
+      setSelectedMessage(message as StoredMessage)
     } catch (error) {
       setSelectedId(null)
       toast.error(
@@ -402,8 +494,9 @@ export function TempMailApp() {
   }
 
   function refreshInbox() {
+    if (!account) return
     setRefreshing(true)
-    void loadMessages(mailbox, true)
+    void loadMessages(account, true)
   }
 
   return (
@@ -447,12 +540,12 @@ export function TempMailApp() {
                     isSharedMailbox && "cursor-default",
                   )}
                   onClick={() => {
-                    if (isSharedMailbox) return
+                    if (isSharedMailbox || creatingMailbox) return
                     setDraftMailbox(mailbox)
                     setIsEditing(true)
                   }}
                   data-shared={isSharedMailbox}
-                  disabled={!ready}
+                  disabled={!ready || creatingMailbox}
                   aria-label={
                     isSharedMailbox
                       ? "Endereço de e-mail compartilhado"
@@ -480,7 +573,7 @@ export function TempMailApp() {
                       size="icon"
                       className="h-12 w-full rounded-xl md:w-12"
                       onClick={handleCopy}
-                      disabled={!ready}
+                      disabled={!ready || creatingMailbox}
                       aria-label="Copiar endereço"
                     >
                       <Copy />
@@ -496,7 +589,7 @@ export function TempMailApp() {
                       size="icon"
                       className="h-12 w-full rounded-xl md:w-12"
                       onClick={() => void shareMailbox()}
-                      disabled={!ready}
+                      disabled={!ready || creatingMailbox}
                       aria-label="Copiar link da caixa de e-mail"
                     >
                       <Share2 />
@@ -512,7 +605,7 @@ export function TempMailApp() {
                       size="icon"
                       className="h-12 w-full rounded-xl md:w-12"
                       onClick={refreshInbox}
-                      disabled={refreshing || !ready}
+                      disabled={refreshing || !ready || creatingMailbox}
                       aria-label="Atualizar mensagens"
                     >
                       <RefreshCw className={cn(refreshing && "animate-spin")} />
@@ -527,10 +620,10 @@ export function TempMailApp() {
                       size="icon"
                       className="h-12 w-full rounded-xl md:w-12"
                       onClick={randomizeMailbox}
-                      disabled={!ready}
+                      disabled={!ready || creatingMailbox}
                       aria-label="Gerar novo endereço"
                     >
-                      <Shuffle />
+                      <Shuffle className={cn(creatingMailbox && "animate-spin")} />
                     </Button>
                   </TooltipTrigger>
                   <TooltipContent>Gerar novo endereço</TooltipContent>
@@ -630,6 +723,18 @@ export function TempMailApp() {
             />
           </div>
         </Card>
+
+        <p className="mt-2 text-center text-[11px] text-muted-foreground">
+          Temporary inbox powered by{" "}
+          <a
+            href="https://mail.tm"
+            target="_blank"
+            rel="noreferrer"
+            className="underline underline-offset-2"
+          >
+            Mail.tm
+          </a>
+        </p>
       </main>
     </div>
   )
