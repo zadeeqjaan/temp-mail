@@ -267,7 +267,39 @@ export function TempMailApp() {
   }, [initializationAttempt])
 
   if (initializationError) {
-    return (\n      <div className="flex min-h-dvh items-center justify-center bg-muted/20 p-6">\n        <Card className="w-full max-w-lg gap-0 p-6">\n          <div className="flex items-center gap-3">\n            <div className="grid size-10 place-items-center rounded-xl border bg-muted/50 text-primary">\n              <AtSign className="size-5" />\n            </div>\n            <div>\n              <h2 className="font-semibold">Não foi possível criar a caixa temporária</h2>\n              <p className="text-sm text-muted-foreground">Mail.tm não respondeu como esperado.</p>\n            </div>\n          </div>\n          <div className="mt-5 rounded-xl border bg-muted/30 p-4 text-sm leading-6 text-muted-foreground">\n            {initializationError}\n          </div>\n          <Button\n            className="mt-5 w-full"\n            onClick={() => {\n              window.localStorage.removeItem(ACCOUNT_STORAGE_KEY)\n              window.localStorage.removeItem(MAILBOX_STORAGE_KEY)\n              window.localStorage.removeItem(DOMAIN_STORAGE_KEY)\n              setInitializationError(null)\n              setInitializationAttempt((value) => value + 1)\n            }}\n          >\n            Tentar novamente\n          </Button>\n        </Card>\n      </div>\n    )\n  }\n\n  const loadMessages = useCallback(
+    return (
+      <div className="flex min-h-dvh items-center justify-center bg-muted/20 p-6">
+        <Card className="w-full max-w-lg gap-0 p-6">
+          <div className="flex items-center gap-3">
+            <div className="grid size-10 place-items-center rounded-xl border bg-muted/50 text-primary">
+              <AtSign className="size-5" />
+            </div>
+            <div>
+              <h2 className="font-semibold">Não foi possível criar a caixa temporária</h2>
+              <p className="text-sm text-muted-foreground">Mail.tm não respondeu como esperado.</p>
+            </div>
+          </div>
+          <div className="mt-5 rounded-xl border bg-muted/30 p-4 text-sm leading-6 text-muted-foreground">
+            {initializationError}
+          </div>
+          <Button
+            className="mt-5 w-full"
+            onClick={() => {
+              window.localStorage.removeItem(ACCOUNT_STORAGE_KEY)
+              window.localStorage.removeItem(MAILBOX_STORAGE_KEY)
+              window.localStorage.removeItem(DOMAIN_STORAGE_KEY)
+              setInitializationError(null)
+              setInitializationAttempt((value) => value + 1)
+            }}
+          >
+            Tentar novamente
+          </Button>
+        </Card>
+      </div>
+    )
+  }
+
+  const loadMessages = useCallback(
     async (activeAccount: MailTmAccount, silent = false) => {
       if (!activeAccount.address) return
 
