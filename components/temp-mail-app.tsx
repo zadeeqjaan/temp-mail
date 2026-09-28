@@ -361,7 +361,7 @@ export function TempMailApp() {
     window.history.replaceState(
       {},
       "",
-      \`\${url.pathname}\${url.search}\${url.hash}\`,
+      `${url.pathname}${url.search}${url.hash}`,
     )
 
     setAccount(nextAccount)
