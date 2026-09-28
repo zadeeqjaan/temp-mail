@@ -201,26 +201,34 @@ export function TempMailApp() {
 
     async function initialize() {
       try {
+        const domains = await getMailTmDomains()
+
+        if (domains.length === 0) {
+          throw new Error("Mail.tm não retornou nenhum domínio disponível.")
+        }
+
         let nextAccount = readStoredAccount()
+        const savedParts = nextAccount ? splitAddress(nextAccount.address) : null
+        const savedDomainIsValid =
+          savedParts !== null && domains.includes(savedParts.domain)
 
-        if (!nextAccount) {
-          const domains = await getMailTmDomains()
-
-          if (domains.length === 0) {
-            throw new Error("Mail.tm não retornou nenhum domínio disponível.")
+        if (!nextAccount || !savedParts || !savedDomainIsValid) {
+          if (typeof window !== "undefined") {
+            window.localStorage.removeItem(ACCOUNT_STORAGE_KEY)
+            window.localStorage.removeItem(MAILBOX_STORAGE_KEY)
+            window.localStorage.removeItem(DOMAIN_STORAGE_KEY)
           }
 
-          const nextDomain = randomDomain(domains)
           nextAccount = await createMailTmAccount(
             createMailboxName(),
-            nextDomain,
+            randomDomain(domains),
           )
         }
 
         const parts = splitAddress(nextAccount.address)
 
-        if (!parts) {
-          throw new Error("A conta temporária salva é inválida.")
+        if (!parts || !domains.includes(parts.domain)) {
+          throw new Error("A conta temporária salva usa um domínio indisponível.")
         }
 
         if (cancelled) return
