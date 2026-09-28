@@ -12,6 +12,7 @@ type MailTmDomainResponse = {
     domain?: string
     isActive?: boolean
   }>
+  "hydra:totalItems"?: number
 }
 
 type MailTmMessageSummary = {
@@ -47,15 +48,15 @@ function randomPassword() {
     )
   }
 
-  return \`\${Date.now()}-\${Math.random().toString(36).slice(2)}\`
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`
 }
 
 async function parseError(response: Response) {
   try {
     const body = (await response.json()) as { message?: string; detail?: string }
-    return body.message || body.detail || \`Mail.tm request failed (\${response.status})\`
+    return body.message || body.detail || `Mail.tm request failed (${response.status})`
   } catch {
-    return \`Mail.tm request failed (\${response.status})\`
+    return `Mail.tm request failed (${response.status})`
   }
 }
 
@@ -72,10 +73,10 @@ async function request(
   }
 
   if (token) {
-    headers.set("Authorization", \`Bearer \${token}\`)
+    headers.set("Authorization", `Bearer ${token}`)
   }
 
-  return fetch(\`\${MAIL_TM_API}\${path}\`, {
+  return fetch(`${MAIL_TM_API}${path}`, {
     ...init,
     headers,
     cache: "no-store",
@@ -83,17 +84,39 @@ async function request(
 }
 
 export async function getMailTmDomains() {
-  const response = await request("/domains")
+  const domains = new Set<string>()
+  const firstResponse = await request("/domains?page=1")
 
-  if (!response.ok) {
-    throw new Error(await parseError(response))
+  if (!firstResponse.ok) {
+    throw new Error(await parseError(firstResponse))
   }
 
-  const data = (await response.json()) as MailTmDomainResponse
-  return (data["hydra:member"] ?? [])
-    .filter((item) => item.isActive !== false && typeof item.domain === "string")
-    .map((item) => item.domain!.toLowerCase())
-    .filter(Boolean)
+  const firstPage = (await firstResponse.json()) as MailTmDomainResponse
+  const totalItems =
+    firstPage["hydra:totalItems"] ?? firstPage["hydra:member"]?.length ?? 0
+  const pageCount = Math.max(1, Math.ceil(totalItems / 30))
+
+  for (const item of firstPage["hydra:member"] ?? []) {
+    if (item.isActive !== false && typeof item.domain === "string") {
+      domains.add(item.domain.toLowerCase())
+    }
+  }
+
+  for (let page = 2; page <= pageCount; page += 1) {
+    const response = await request(`/domains?page=${page}`)
+    if (!response.ok) break
+
+    const data = (await response.json()) as MailTmDomainResponse
+    for (const item of data["hydra:member"] ?? []) {
+      if (item.isActive !== false && typeof item.domain === "string") {
+        domains.add(item.domain.toLowerCase())
+      }
+    }
+  }
+
+  return [...domains].filter(
+    (domain) => domain !== "example.com" && domain !== "example.net",
+  )
 }
 
 async function getToken(address: string, password: string) {
@@ -123,7 +146,7 @@ export async function createMailTmAccount(
   let lastError: Error | null = null
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const address = \`\${mailbox}@\${domain}\`
+    const address = `${mailbox}@${domain}`
     const password = randomPassword()
 
     const response = await request("/accounts", {
@@ -148,7 +171,7 @@ export async function createMailTmAccount(
       break
     }
 
-    mailbox = \`\${mailbox}-\${Math.floor(100 + Math.random() * 900)}\`.slice(
+    mailbox = `${mailbox}-${Math.floor(100 + Math.random() * 900)}`.slice(
       0,
       64,
     )
@@ -197,7 +220,7 @@ export async function listMailTmMessages(
     title: message.subject?.trim() || "(sem assunto)",
     sender:
       message.from?.name && message.from.address
-        ? \`\${message.from.name} <\${message.from.address}>\`
+        ? `${message.from.name} <${message.from.address}>`
         : message.from?.address || message.from?.name || "Remetente desconhecido",
     receivedAt: message.createdAt,
   }))
@@ -209,7 +232,7 @@ export async function readMailTmMessage(
 ) {
   const response = await authorizedRequest(
     account,
-    \`/messages/\${encodeURIComponent(id)}\`,
+    `/messages/${encodeURIComponent(id)}`,
   )
 
   if (!response.ok) {
@@ -220,7 +243,7 @@ export async function readMailTmMessage(
 
   void authorizedRequest(
     account,
-    \`/messages/\${encodeURIComponent(id)}\`,
+    `/messages/${encodeURIComponent(id)}`,
     { method: "PATCH" },
   ).catch(() => undefined)
 
